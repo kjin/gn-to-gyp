@@ -1,5 +1,6 @@
 import * as execa from 'execa';
 import { promises as fs } from 'fs';
+import * as path from 'path';
 
 namespace util {
   export function reportListStatistics<S>(arr: S[], pred: (arg: S) => any): { [k: string]: number } {
@@ -12,11 +13,29 @@ namespace util {
   }
 
   // For use in reduce()
-  export function removeDuplicates<S>(arr: S[], e: S) {
+  export function flatten<T>(arr: T[], e: T[]) {
+    arr.push(...e);
+    return arr;
+  }
+
+  // For use in reduce()
+  export function removeDuplicates<T>(arr: T[], e: T) {
     if (arr.indexOf(e) === -1) {
       arr.push(e);
     }
     return arr;
+  }
+
+  export function arrayEquals<T>(a: T[], b: T[]): boolean {
+    if (a.length !== b.length) {
+      return false;
+    }
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) {
+        return false;
+      }
+    }
+    return true;
   }
 }
 
@@ -32,6 +51,9 @@ namespace gn {
     outputs?: string[];
     args?: string[];
     script?: string;
+    libs?: string[];
+    cflags?: string[];
+    cflags_cc?: string[];
   }
   
   interface GnDescription {
@@ -49,14 +71,132 @@ namespace gn {
     action: string[];
   }
   
-  interface GypTarget {
-    target_name: string;
-    type: string;
-    dependencies?: string[];
+  interface GypFields {
+    toolsets?: string[];
+    target_conditions?: Array<[string, GypFields]>;
     include_dirs?: string[];
+    dependencies?: string[];
     defines?: string[];
     sources?: string[];
     actions?: GypAction[];
+    link_settings?: {
+      libraries?: string[];
+    }
+    cflags?: string[];
+    cflags_cc?: string[];
+  }
+
+  interface GypTarget extends GypFields {
+    target_name: string;
+    type: string;
+  }
+
+  class GypTargetBuilder {
+    private readonly targetFragments = new Map<string, GypFields & { outputs?: string[] }>();
+
+    constructor(
+      readonly targetName: string,
+      readonly targetType: string) {}
+
+    setForToolchain(toolchain: string, fragment: GypFields, outputs?: string[]) {
+      if (fragment.target_conditions) {
+        throw new Error(`Individual toolchain config shouldn't have its own target conditions: ${toolchain}, ${fragment.target_conditions}`);
+      }
+      this.targetFragments.set(toolchain, Object.assign({ outputs }, fragment));
+    }
+
+    private buildTarget(): GypTarget {
+      const builds = Array.from(this.targetFragments.keys());
+      let result: GypTarget = {
+        target_name: this.targetName,
+        type: this.targetType
+      };
+      result.toolsets = builds;
+      if (builds.length === 1) {
+        result = Object.assign({}, this.targetFragments.get(builds[0])!, result);
+        delete (result as any).outputs;
+      } else {
+        const deps: string[] = [];
+        {
+          let depsSet = false;
+          builds.forEach(build => {
+            const toolchainAgnosticDeps = (this.targetFragments.get(build)!.dependencies || []).map(dependency => {
+              const sameBuildSuffix = `#${build}`;
+              if (!dependency.endsWith(sameBuildSuffix)) {
+                throw new Error(`${this.targetName} for ${build} toolchain has a non-${build} dependency`);
+              }
+              return dependency.slice(0, dependency.length - sameBuildSuffix.length);
+            });
+            if (!depsSet) {
+              deps.push(...toolchainAgnosticDeps);
+            } else {
+              if (!util.arrayEquals(deps, toolchainAgnosticDeps)) {
+                throw new Error(`${this.targetName} has different dependencies for different toolchains`);
+              }
+            }
+          });
+        }
+        result.target_conditions = builds.map(build => {
+          const targetForBuild = Object.assign({}, this.targetFragments.get(build)!);
+          delete targetForBuild.dependencies;
+          delete targetForBuild.outputs;
+          return [`_toolset=="${build}"`, targetForBuild] as [string, GypFields]
+        });
+        result.dependencies = deps;
+      }
+      return result;
+    }
+
+    private buildProxy(): GypTarget {
+      if (this.targetType !== 'executable') {
+        throw new Error('Proxies only make sense for executables');
+      }
+      const builds = Array.from(this.targetFragments.keys());
+      const actionsForBuilds: GypFields[] = builds.map(build => {
+        const outputs = this.targetFragments.get(build)!.outputs;
+        if (!outputs || outputs.length !== 1) {
+          throw new Error(`${this.targetName} as an executable should have just one output`);
+        }
+        return {
+          actions: [
+            {
+              action_name: `move_as_expected_output`,
+              action: [
+                'cp',
+                '<@(_inputs)',
+                '<@(_outputs)',
+              ],
+              inputs: [`<@(PRODUCT_DIR)/${this.targetName}_proxy`],
+              outputs: [outputs[0]]
+            }
+          ]
+        };
+      });
+      const result: GypTarget = {
+        target_name: this.targetName,
+        type: 'none',
+        dependencies: [`${this.targetName}_proxy`]
+      };
+      if (builds.length === 1) {
+        Object.assign(result, actionsForBuilds[0]);
+      } else {
+        result.target_conditions = actionsForBuilds.map((actionForBuild, i) => {
+          return [`_toolset=="${builds[i]}"`, actionForBuild] as [string, GypFields]
+        });;
+      }
+      return result;
+    }
+
+    buildWithProxy(): GypTarget[] {
+      const mainTarget = this.buildTarget();
+      if (this.targetType === 'executable') {
+        mainTarget.target_name = `${this.targetName}_proxy`;
+        const proxyTarget = this.buildProxy();
+        return [mainTarget, proxyTarget];
+      } else {
+        return [mainTarget];
+      }
+    }
   }
   
   interface GypFile {
@@ -98,9 +238,16 @@ namespace gn {
       }, {});
   }
 
-  function gypifyTargetName(target: string): string {
+  /**
+   * Given a GN target name, create a reasonable GYP target name.
+   * @param target 
+   */
+  function gypifyTargetName(target: string): { target: string, toolchain: string } {
+    // TODO: These are swapped (host<->target)
+    let toolchain = 'host';
     if (target.indexOf('(') !== -1) {
       target = target.slice(0, target.indexOf('('));
+      toolchain = 'target';
     }
     target = target.slice(2);
     target = target.replace(':', '_');
@@ -110,26 +257,87 @@ namespace gn {
     while (target.indexOf('+') !== -1) {
       target = target.replace('+', '_');
     }
-    return target;
+    return { target, toolchain };
   }
 
-  function gypifyTargetType(type: string): string {
-    switch (type) {
+  /**
+   * Given a GN target type, return a corresponding GYP target type.
+   * @param gnType The GN type.
+   */
+  function gypifyTargetType(gnType: string): string {
+    switch (gnType) {
       case 'source_set':
+        // In the GN docs, a source set is a "virtual static library", where no
+        // real output is produced. In GYP this should be equivalent, even
+        // though we do produce an output so it would be expected that this is
+        // slower.
+        return 'static_library';
       case 'group':
       case 'action':
       case 'action_foreach':
       case 'copy':
+        // Caller is responsible for replicating the associated action in
+        // question, if there is one.
         return 'none';
       default:
-        return type;
+        return gnType;
     }
   }
 
-  export function createGypFile(target: string, desc: GnDescription): GypFile {
-    const result: GypFile = {
-      targets: []
-    };
+  /**
+   * Given a list of C flags, extract the include directories.
+   * @param cflags A list of C flags.
+   */
+  function extractIncludes(cflags: string[]): string[] {
+    const result = [];
+    for (let i = 0; i < cflags.length; i++) {
+      if (cflags[i].match(/^-[Ii]/)) {
+        if (i + 1 === cflags.length) {
+          throw new Error(`Unexpected value for last cflag: ${cflags[i]}`);
+        }
+        // Every include seems to be relative to a two-level deep directory.
+        // For the purposes of building, lop one layer of depth off.
+        result.push(cflags[i + 1].slice('../'.length));
+      }
+    }
+    return result;
+  }
+
+  export function createGypFile(target: string, allDescs: GnAllDescriptions): GypFile {
+    const build = 'mac_debug';
+    const desc = allDescs[build];
+    const result = new Map<string, GypTargetBuilder>();
+
+    const canonicalizePath = (p: string): string => {
+      const outPrefix = `//out/${build}/`;
+      if (p.startsWith(outPrefix)) {
+        return `<(SHARED_INTERMEDIATE_DIR)/${p.slice(outPrefix.length)}`;
+      } else if (p.startsWith('//')) {
+        return `../${p.slice(2)}`;
+      }
+      throw new Error(`Unexpected path: ${p}`);
+    }
+
+    // specific for Perfetto
+    function correctPathsForScriptArgs(script: string, args: string[]): string[] {
+      if (script === '//gn/standalone/build_tool_wrapper.py') {
+        return args.map(arg => {
+          if (arg.startsWith('../')) {
+            return arg.slice(3);
+          } else if (arg.startsWith('--')) {
+            arg = arg.replace(/^(--plugin=protoc-gen-plugin=)(.*)$/, `$1<(SHARED_INTERMEDIATE_DIR)/$2`);
+            arg = arg.replace(/^(--plugin_out=.*):(.*)$/, `$1:<(SHARED_INTERMEDIATE_DIR)/$2`);
+            return arg;
+          } else {
+            const p = `//${path.join(`out/${build}`, arg)}`;
+            return canonicalizePath(p);
+          }
+        })
+      } else {
+        throw new Error('unknown script ' + script);
+      }
+    }
+
     // gnTargets is the queue of targets that still need to be created.
     const gnTargets = [target];
     while (gnTargets.length > 0) {
@@ -141,45 +349,92 @@ namespace gn {
         throw new Error(`No value in desc under ${gnTargetName}`);
       }
       // Get its dependencies.
+      // TODO: Sometimes deps don't actually get run, and have to be make'd individually. Figure out why.
       const deps = (gnTarget.deps || []);
       // For dependencies that have not yet been processed, add them to the
       // queue to be processed later.
       gnTargets.push(...deps.filter(dep => {
-        const gypDep = gypifyTargetName(dep);
-        return !gnTargets.some(target => target === dep) &&
-          !result.targets.some(target => target.target_name === gypDep);
+        return !gnTargets.some(target => target === dep);
       }));
+      // Create the list of include dirs.
+      const includeDirs: string[] = [
+        ...(gnTarget.include_dirs || []).map(canonicalizePath),
+        ...extractIncludes(gnTarget.cflags || [])
+      ].reduce(util.removeDuplicates, [] as string[]);
       // Create the corresponding GYP target.
-      const gypTarget: GypTarget = {
-        target_name: gypifyTargetName(gnTargetName),
-        type: gypifyTargetType(gnTarget.type),
-        include_dirs: (gnTarget.include_dirs || [])
-          .map(dir => dir.slice(2))
-          .reduce(util.removeDuplicates, [] as string[]) as string[],
+      const {
+        target: targetName,
+        toolchain: targetToolchain
+      } = gypifyTargetName(gnTargetName);
+      const targetType = gypifyTargetType(gnTarget.type);
+      const gypFields: GypFields = {
+        include_dirs: includeDirs,
         defines: gnTarget.defines || [],
-        sources: (gnTarget.sources || [])
-          .map(dir => dir.slice(2)),
-        dependencies: deps.map(gypifyTargetName)
+        // TODO: empty.cc is here to satisfy the linker.
+        // Make it a generated file?
+        sources: [...(gnTarget.sources || []), `//empty.cc`].map(canonicalizePath),
+        dependencies: deps.map(gypifyTargetName).map(dep => `${dep.target}#${dep.toolchain}`),
+        cflags: gnTarget.cflags || [],
+        cflags_cc: gnTarget.cflags_cc || []
       };
+      // Apparently libs not allowed in DEBUG.
+      // if (gnTarget.libs) {
+      //   gypFields.link_settings = {
+      //     libraries: gnTarget.libs.map(l => `-l${l}`)
+      //   };
+      // }
       // If it exists, attach a GYP action.
       switch (gnTarget.type) {
         case 'action': {
-          gypTarget.actions = [{
-            action_name: `${gypTarget.target_name}_action`,
-            inputs: (gnTarget.inputs || []).map(dir => dir.slice(2)),
-            outputs: (gnTarget.outputs || []).map(dir => dir.slice(2)),
+          if (!gnTarget.script) {
+            throw new Error(`${gnTargetName} is an action but has no script`);
+          }
+          const metaInputs = [
+            ...(gnTarget.inputs || []),
+            ...(gnTarget.sources || [])
+          ];
+          gypFields.actions = [{
+            action_name: `${targetName}_action`,
+            inputs: metaInputs.map(canonicalizePath),
+            outputs: (gnTarget.outputs || []).map(canonicalizePath),
             action: [
-              gnTarget.script!.slice(2),
-              ...(gnTarget.args || [])
+              ...(gnTarget.script.endsWith('.py') ? ['python'] : []),
+              canonicalizePath(gnTarget.script!),
+              ...correctPathsForScriptArgs(gnTarget.script, gnTarget.args || [])
             ]
           }];
           break;
         }
+        case 'action_foreach': {
+          throw new Error(`action_foreach is untested`);
+          // const metaInputs = [
+          //   ...(gnTarget.inputs || []),
+          //   ...(gnTarget.sources || [])
+          // ];
+          // gypTarget.actions = [
+          //   ...metaInputs.map((input, num) => ({
+          //     action_name: `${gypTarget.target_name}_action_${num}`,
+          //     inputs: [canonicalizePath(input)],
+          //     outputs: [],
+          //     action: [
+          //       canonicalizePath(gnTarget.script!),
+          //       ...(gnTarget.args || [])
+          //     ]
+          //   })),
+          //   {
+          //     action_name: `${gypTarget.target_name}_action_final`,
+          //     inputs: [],
+          //     outputs: (gnTarget.outputs || []).map(canonicalizePath),
+          //     action: []
+          //   }
+          // ];
+          // break;
+        }
         case 'copy': {
-          gypTarget.actions = [{
-            action_name: `${gypTarget.target_name}_action`,
-            inputs: (gnTarget.sources || []).map(dir => dir.slice(2)),
-            outputs: (gnTarget.outputs || []).map(dir => dir.slice(2)),
+          gypFields.actions = [{
+            action_name: `${targetName}_action`,
+            inputs: (gnTarget.sources || []).map(canonicalizePath),
+            outputs: (gnTarget.outputs || []).map(canonicalizePath),
             action: [
               'cp',
               '<@(_inputs)',
@@ -190,9 +445,17 @@ namespace gn {
         }
       }
       // Put it in our result.
-      result.targets.push(gypTarget);
+      if (!result.has(targetName)) {
+        result.set(targetName, new GypTargetBuilder(targetName, targetType));
+      } else if (targetType !== result.get(targetName)!.targetType) {
+        throw new Error(`Mismatched types for a target with multiple toolchains`);
+      }
+      result.get(targetName)!.setForToolchain(targetToolchain, gypFields, (gnTarget.outputs || []).map(canonicalizePath));
     }
-    return result;
+    return {
+      targets: Array.from(result.values()).map(builder => builder.buildWithProxy())
+        .reduce(util.flatten)
+    };
   }
 }
 
@@ -214,22 +477,23 @@ async function main(args: string[]) {
   // Run a query (?)
   for (const build of ['debug', 'release']) {
     const targets = Object.keys(allDescs[`mac_${build}`])
-      .map(k => allDescs[`mac_${build}`][k])
+      .map(k => allDescs[`mac_${build}`][k]);
     console.log(build, util.reportListStatistics(
       targets,
         // .filter(a => a.type === 'source_set'),
-      a => a.type
+      a => a.script
     ));
   }
 
   // Write the gyp file
-  const result = gn.createGypFile('//:libperfetto', allDescs['mac_debug']);
+  const result = gn.createGypFile('//:libperfetto', allDescs);
   await fs.writeFile(`${perfettoDir}/gypfiles/perfetto.gyp`, JSON.stringify(result, null, 2));
 
+  const lib = 'perfetto';
   await execa('./tools/gyp/gyp', [
     '-f',
     'make',
-    '/Users/kelvinjin/src/node-ci/node-ci/node/deps/perfetto/gypfiles/perfetto.gyp',
+    `/Users/kelvinjin/src/node-ci/node-ci/node/deps/${lib}/gypfiles/${lib}.gyp`,
     '-I',
     '/Users/kelvinjin/src/node-ci/node-ci/node/common.gypi',
     '-I',
@@ -243,7 +507,10 @@ async function main(args: string[]) {
     '-Dlinux_use_bundled_binutils=0',
     '-Dlinux_use_bundled_gold=0',
     '-Dlinux_use_gold_flags=0'
-  ]);
+  ], {
+    stdio: 'inherit'
+  });
 }
 
 main(process.argv.slice(2)).catch(console.error);
+// need to pull in empty files sometimes.
