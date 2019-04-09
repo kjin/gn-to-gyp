@@ -84,6 +84,7 @@ namespace gn {
     }
     cflags?: string[];
     cflags_cc?: string[];
+    hard_dependency?: string;
   }
 
   interface GypTarget extends GypFields {
@@ -134,6 +135,7 @@ namespace gn {
                 throw new Error(`${this.targetName} has different dependencies for different toolchains`);
               }
             }
+            depsSet = true;
           });
         }
         result.target_conditions = builds.map(build => {
@@ -175,14 +177,15 @@ namespace gn {
       const result: GypTarget = {
         target_name: this.targetName,
         type: 'none',
-        dependencies: [`${this.targetName}_proxy`]
+        dependencies: [`${this.targetName}_proxy`],
+        toolsets: builds
       };
       if (builds.length === 1) {
         Object.assign(result, actionsForBuilds[0]);
       } else {
         result.target_conditions = actionsForBuilds.map((actionForBuild, i) => {
           return [`_toolset=="${builds[i]}"`, actionForBuild] as [string, GypFields]
-        });;
+        });
       }
       return result;
     }
@@ -243,11 +246,10 @@ namespace gn {
    * @param target 
    */
   function gypifyTargetName(target: string): { target: string, toolchain: string } {
-    // TODO: These are swapped (host<->target)
-    let toolchain = 'host';
+    let toolchain = 'target';
     if (target.indexOf('(') !== -1) {
       target = target.slice(0, target.indexOf('('));
-      toolchain = 'target';
+      toolchain = 'host';
     }
     target = target.slice(2);
     target = target.replace(':', '_');
@@ -307,6 +309,22 @@ namespace gn {
     const build = 'mac_debug';
     const desc = allDescs[build];
     const result = new Map<string, GypTargetBuilder>();
+
+    // Create a dummy empty.cc file action.
+    const emptyCCTarget = new GypTargetBuilder('gen_empty_cc', 'none');
+    for (const toolchain of ['host', 'target']) {
+      emptyCCTarget.setForToolchain(toolchain, {
+        actions: [
+          {
+            action_name: 'gen_empty_cc_action',
+            inputs: [],
+            outputs: ['<(SHARED_INTERMEDIATE_DIR)/empty.cc'],
+            action: ['touch', '<(SHARED_INTERMEDIATE_DIR)/empty.cc']
+          }
+        ]
+      });
+    }
+    result.set('gen_empty_cc', emptyCCTarget);
 
     const canonicalizePath = (p: string): string => {
       const outPrefix = `//out/${build}/`;
@@ -370,13 +388,20 @@ namespace gn {
       const gypFields: GypFields = {
         include_dirs: includeDirs,
         defines: gnTarget.defines || [],
-        // TODO: empty.cc is here to satisfy the linker.
-        // Make it a generated file?
-        sources: [...(gnTarget.sources || []), `//empty.cc`].map(canonicalizePath),
+        // empty.cc is here to satisfy the linker if there are no cc files.
+        // TODO Make this more robust.
+        sources: (gnTarget.sources || []).map(canonicalizePath),
         dependencies: deps.map(gypifyTargetName).map(dep => `${dep.target}#${dep.toolchain}`),
         cflags: gnTarget.cflags || [],
-        cflags_cc: gnTarget.cflags_cc || []
+        cflags_cc: gnTarget.cflags_cc || [],
+        // Static libraries cannot depend on each other in GYP unless this flag
+        // is set to true.
+        hard_dependency: 'True'
       };
+      if (targetType === 'static_library') {
+        gypFields.sources!.push('<(SHARED_INTERMEDIATE_DIR)/empty.cc');
+        gypFields.dependencies!.push(`gen_empty_cc#${targetToolchain}`);
+      }
       // Apparently libs not allowed in DEBUG.
       // if (gnTarget.libs) {
       //   gypFields.link_settings = {
