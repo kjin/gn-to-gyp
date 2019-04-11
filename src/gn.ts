@@ -1,6 +1,7 @@
-import { removeDuplicates, flatten, deserializeMap, serializeMap } from "./util";
-import execa = require("execa");
-import { promises as fs } from 'fs';
+import {deserializeMap, flatten, removeDuplicates, serializeMap} from './util';
+
+import execa = require('execa');
+import {promises as fs} from 'fs';
 
 /**
  * A string assumed to always exist in a project as the top-level target name.
@@ -51,10 +52,10 @@ export function parseGnTargetName(targetName: string): ParsedGnTargetName {
   const match = targetName.match(/^\/\/([^:]*):([^:]*)(?:\((.*)\))?$/);
   if (!match) {
     throw new Error(
-      `A target name doesn't match the expected regex: ${targetName}`);
+        `A target name doesn't match the expected regex: ${targetName}`);
   }
   const [_, file, target, toolchain] = match;
-  return { path: file, target, toolchain };
+  return {path: file, target, toolchain};
 }
 
 /**
@@ -63,7 +64,7 @@ export function parseGnTargetName(targetName: string): ParsedGnTargetName {
 export class GnBuild {
   private targets = new Map<string, GnTarget>();
   private toolchains: string[] = [];
-  private defaultToolchain: string = '';
+  private defaultToolchain = '';
 
   private constructor() {}
 
@@ -115,9 +116,10 @@ export class GnBuild {
    */
   static deserialize(json: string): GnBuild {
     const result = new GnBuild();
-    result.targets = deserializeMap(json, k => k, v => JSON.parse(v) as GnTarget);
-    result.toolchains = Array.from(result.targets.values())
-      .map(target => target.toolchain);
+    result.targets =
+        deserializeMap(json, k => k, v => JSON.parse(v) as GnTarget);
+    result.toolchains =
+        Array.from(result.targets.values()).map(target => target.toolchain);
     // Assume that TARGET_ALL is always built with target toolchain.
     if (!result.targets.has(TARGET_ALL)) {
       throw new Error(`GnBuild has no ${TARGET_ALL} target`);
@@ -167,9 +169,9 @@ export class GnProject {
    */
   getTargetNames(): string[] {
     return Array.from(this.builds.values())
-      .map(target => Array.from(target.getTargetNames()))
-      .reduce(flatten, [] as string[])
-      .reduce(removeDuplicates, [] as string[]);
+        .map(target => Array.from(target.getTargetNames()))
+        .reduce(flatten, [] as string[])
+        .reduce(removeDuplicates, [] as string[]);
   }
 
   /**
@@ -199,7 +201,8 @@ export class GnProject {
    * directory names in the out/ directory. Omit or pass a falsy value to
    * search out/ for builds to process.
    */
-  static async fromDirectory(projectDir: string, builds?: string[]): Promise<GnProject> {
+  static async fromDirectory(projectDir: string, builds?: string[]):
+      Promise<GnProject> {
     // If no builds provided, search the out/ directory.
     if (!builds) {
       builds = await fs.readdir(`${projectDir}/out`);
@@ -210,7 +213,7 @@ export class GnProject {
       const knownTargets: Map<string, Promise<GnDescription>> = new Map();
       // Helper function -- get the `gn desc` for a single target and
       // dependencies, populating knownTargets, which also doubles as a cache.
-      const getSingleTarget = async (target: string): Promise<GnDescription> => {
+      const getSingleTarget = async(target: string): Promise<GnDescription> => {
         // Don't do any extra processing if we've already seen the target
         // before.
         if (knownTargets.has(target)) {
@@ -218,7 +221,13 @@ export class GnProject {
         }
         const desc = (async () => {
           // The actual call to `gn desc`.
-          const output = await execa.stdout('gn', ['desc', `out/${build}`, target, '--all-toolchains', '--format=json'], { cwd: projectDir });
+          const output = await execa.stdout(
+              'gn',
+              [
+                'desc', `out/${build}`, target, '--all-toolchains',
+                '--format=json'
+              ],
+              {cwd: projectDir});
           const desc: GnDescription = JSON.parse(output);
           return desc;
         })();
@@ -229,7 +238,7 @@ export class GnProject {
         // Wait until all dependents have been resolved.
         await Promise.all((await desc)[target].deps.map(getSingleTarget));
         return desc;
-      }
+      };
       // Call the above mentioned helper function for the top-level target,
       // assumed to be TARGET_ALL.
       await getSingleTarget(TARGET_ALL);
@@ -242,15 +251,16 @@ export class GnProject {
       // Sort and merge these objects together so we get something like
       // { a: x, b: y }.
       return allTargets
-        .sort((a, b) => Object.keys(a)[0].localeCompare(Object.keys(b)[0]))
-        .reduce((acc, next) => {
-          return Object.assign(acc, next);
-        }, {});
+          .sort((a, b) => Object.keys(a)[0].localeCompare(Object.keys(b)[0]))
+          .reduce((acc, next) => {
+            return Object.assign(acc, next);
+          }, {});
     }));
     // All builds have been described.
     const result = new GnProject();
     for (let i = 0; i < builds.length; i++) {
-      result.builds.set(builds[i], GnBuild.deserialize(JSON.stringify(gnDescs[i])));
+      result.builds.set(
+          builds[i], GnBuild.deserialize(JSON.stringify(gnDescs[i])));
     }
     return result;
   }

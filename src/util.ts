@@ -5,8 +5,9 @@
  * @param arr The array over which to map.
  * @param fn A mapping function.
  */
-export function reportListStatistics<S>(arr: S[], fn: (arg: S) => any): { [k: string]: number } {
-  const result: { [k: string]: number } = {};
+export function reportListStatistics<S>(
+    arr: S[], fn: (arg: S) => {}): {[k: string]: number} {
+  const result: {[k: string]: number} = {};
   for (const arg of arr) {
     const key = `${fn(arg)}`;
     result[key] = (result[key] || 0) + 1;
@@ -28,7 +29,7 @@ export function flatten<T>(acc: T[], e: T[]) {
  * Array#reduce function that removes duplicates in an array/
  * @param acc The accumulator.
  * @param e An element that should be added to the accumulator if it's not there
- *          already.
+ * already.
  */
 export function removeDuplicates<T>(arr: T[], e: T) {
   if (arr.indexOf(e) === -1) {
@@ -61,10 +62,11 @@ export function arrayEquals<T>(a: T[], b: T[]): boolean {
  * @param arr The array over which to map.
  * @param fn The mapping function.
  */
-export function getOnlyMappedValue<S, T>(arr: Array<S>, fn: (s: S) => T): T {
+export function getOnlyMappedValue<S, T>(arr: S[], fn: (s: S) => T): T {
   const results: T[] = arr.map(x => fn(x)).reduce(removeDuplicates, [] as T[]);
   if (results.length !== 1) {
-    throw new Error(`Array passed to getOnlyMappedValue has ${results.length} mapped values`);
+    throw new Error(`Array passed to getOnlyMappedValue has ${
+        results.length} mapped values`);
   }
   return results[0];
 }
@@ -76,10 +78,9 @@ export function getOnlyMappedValue<S, T>(arr: Array<S>, fn: (s: S) => T): T {
  * @param serializeValue How to convert values to strings.
  */
 export function serializeMap<S, T>(
-  map: Map<S, T>,
-  serializeKey: (k: S) => string,
-  serializeValue: (v: T) => string
-): string {
+    map: Map<S, T>, serializeKey: (k: S) => string,
+    serializeValue: (v: T) => string): string {
+  // tslint:disable-next-line:no-any
   const result: any = {};
   for (const key of Array.from(map.keys())) {
     result[serializeKey(key)] = JSON.parse(serializeValue(map.get(key)!));
@@ -94,10 +95,8 @@ export function serializeMap<S, T>(
  * @param deserializeValue How to re-hydrate values.
  */
 export function deserializeMap<S, T>(
-  json: string,
-  deserializeKey: (k: string) => S,
-  deserializeValue: (v: string) => T
-): Map<S, T> {
+    json: string, deserializeKey: (k: string) => S,
+    deserializeValue: (v: string) => T): Map<S, T> {
   const result = new Map<S, T>();
   const obj = JSON.parse(json);
   for (const key of Object.keys(obj)) {
