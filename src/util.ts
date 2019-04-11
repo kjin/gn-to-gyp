@@ -104,3 +104,42 @@ export function deserializeMap<S, T>(
   }
   return result;
 }
+
+/**
+ * Given an async function and a number X, returns a wrapper for that function
+ * with the same API, but ensures that the function is only called with X
+ * concurrency.
+ * @param fn An async function.
+ * @param poolSize The pool size.
+ */
+export function pool<S extends any[], T>(fn: (...args: S) => Promise<T>, poolSize: number): (...args: S) => Promise<T> {
+  if (poolSize === Infinity) {
+    return fn;
+  } else if (poolSize <= 0) {
+    throw new Error(`pool called with size = ${poolSize}`);
+  }
+  const pendingPromises: Array<Promise<T>> = [];
+  return async (...args: S): Promise<T> => {
+    while (poolSize <= 0) {
+      const preWork = Promise.race(pendingPromises);
+      try {
+        await preWork;
+      } catch (e) {
+        // Someone else's failure is not our business
+      }
+    }
+    poolSize--;
+    const pendingPromise = fn(...args);
+    pendingPromises.push(pendingPromise);
+    try {
+      return await pendingPromise;
+    } catch (e) {
+      // It's important that we have a catch handler here, so Promise.race
+      // doesn't eat it
+      throw e;
+    } finally {
+      poolSize++;
+      pendingPromises.splice(pendingPromises.indexOf(pendingPromise), 1);
+    }
+  };
+}

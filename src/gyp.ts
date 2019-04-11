@@ -1,5 +1,5 @@
 import {GnProject, GnTarget, parseGnTargetName} from './gn';
-import {arrayEquals, getOnlyMappedValue, removeDuplicates} from './util';
+import {arrayEquals, getOnlyMappedValue, removeDuplicates, flatten} from './util';
 
 /**
  * A message to place at the top of a generated GYP file.
@@ -31,6 +31,8 @@ interface GypFields {
   cflags?: string[];
   cflags_cc?: string[];
   hard_dependency?: string;
+  direct_dependent_settings?: GypFields;
+  all_dependent_settings?: GypFields;
 }
 
 /**
@@ -318,10 +320,16 @@ class GypProjectBuilder {
    * @param gnProject The GN project.
    * @param correctPathsForScriptArgs A function describing how path arguments
    * to scripts should be corrected.
+   * @param gnRootTargetName The root target that will be processed. This info
+   * is important because for the root target, also specify public
+   * configuration. Child targets don't need this because their public
+   * configurations are already reflected in their parents as a result of
+   * `gn desc`.
    */
   constructor(
       private readonly gnProject: GnProject,
-      private readonly correctPathsForScriptArgs: CorrectPathsForScriptArgs) {}
+      private readonly correctPathsForScriptArgs: CorrectPathsForScriptArgs,
+      private readonly gnRootTargetName: string) {}
 
   /**
    * Given a GN build and GN toolchain, return a suitable GYP toolset, or throw
@@ -357,6 +365,9 @@ class GypProjectBuilder {
     ].reduce(removeDuplicates, [] as string[]);
     // Create the corresponding GYP target.
     const targetName = gypifyTargetName(gnTargetBuildConfig.name);
+    if (!gnTarget.type) {
+      throw new Error(`GN target ${targetName} has no type.`);
+    }
     const targetType = gypifyTargetType(gnTarget.type);
     const targetToolchain = this.toGypToolset(
         gnTargetBuildConfig.build, gnTargetBuildConfig.toolchain);
@@ -380,6 +391,18 @@ class GypProjectBuilder {
       hard_dependency: 'True',
       toolsets: [targetToolchain]
     };
+    if (gnTargetBuildConfig.name === this.gnRootTargetName) {
+      // TODO(kjin): This is pointless.
+      const build = this.gnProject.getBuild(gnTargetBuildConfig.build);
+      const includeDirs: string[] = (gnTarget.public_configs || [])
+        .map(config => build.getTarget(gnTargetBuildConfig.toolchain, config).deps)
+        .reduce(flatten, [] as string[])
+        .map(boundGypifyPath)
+        .reduce(removeDuplicates, [] as string[]);
+      fragment.direct_dependent_settings = {
+        include_dirs: includeDirs
+      };
+    }
     if (targetType === 'static_library') {
       fragment.sources!.push('<(SHARED_INTERMEDIATE_DIR)/empty.cc');
       fragment.dependencies!.push(`gen_empty_cc#${targetToolchain}`);
@@ -551,7 +574,7 @@ export class GypProject {
         gnTargetDeps.map(dep => dep.name)
             .reduce(removeDuplicates, [] as string[]);
     const projectBuilder =
-        new GypProjectBuilder(gnProject, correctPathsForScriptArgs);
+        new GypProjectBuilder(gnProject, correctPathsForScriptArgs, gnRootTarget);
     for (const gnTargetDepName of gnTargetDepNames) {
       const gypTargets = projectBuilder.toGypTargets(gnTargetDeps.filter(
           gnTargetDep => gnTargetDep.name === gnTargetDepName));

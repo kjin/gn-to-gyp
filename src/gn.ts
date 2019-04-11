@@ -1,4 +1,4 @@
-import {deserializeMap, flatten, removeDuplicates, serializeMap} from './util';
+import {deserializeMap, flatten, removeDuplicates, serializeMap, pool} from './util';
 
 import execa = require('execa');
 import {promises as fs} from 'fs';
@@ -12,8 +12,12 @@ const TARGET_ALL = '//:all';
  * A description of a GN build target.
  */
 export interface GnTarget {
+  public_deps?: string[];
+  configs?: string[];
+  public_configs?: string[];
+  all_dependent_configs?: string[];
   deps: string[];
-  type: string;
+  type?: string;
   toolchain: string;
   include_dirs?: string[];
   defines?: string[];
@@ -207,24 +211,25 @@ export class GnProject {
     if (!builds) {
       builds = await fs.readdir(`${projectDir}/out`);
     }
+    const pooledExecaStdout = pool(execa.stdout, 8);
     // Get descriptions for all builds in parallel.
     const gnDescs = await Promise.all(builds.map(async (build) => {
       // A map containing all targets.
       const knownTargets: Map<string, Promise<GnDescription>> = new Map();
       // Helper function -- get the `gn desc` for a single target and
       // dependencies, populating knownTargets, which also doubles as a cache.
-      const getSingleTarget = async(target: string): Promise<GnDescription> => {
+      const getSingleTarget = async(targetName: string): Promise<GnDescription> => {
         // Don't do any extra processing if we've already seen the target
         // before.
-        if (knownTargets.has(target)) {
-          return knownTargets.get(target)!;
+        if (knownTargets.has(targetName)) {
+          return knownTargets.get(targetName)!;
         }
         const desc = (async () => {
           // The actual call to `gn desc`.
-          const output = await execa.stdout(
+          const output = await (pooledExecaStdout as typeof execa.stdout)(
               'gn',
               [
-                'desc', `out/${build}`, target, '--all-toolchains',
+                'desc', `out/${build}`, targetName, '--all-toolchains',
                 '--format=json'
               ],
               {cwd: projectDir});
@@ -234,9 +239,24 @@ export class GnProject {
         // Save the pending target description into the cache.
         // We save the pending description instead of the resolve one so that
         // we don't do redundant async work.
-        knownTargets.set(target, desc);
+        knownTargets.set(targetName, desc);
         // Wait until all dependents have been resolved.
-        await Promise.all((await desc)[target].deps.map(getSingleTarget));
+        const awaitedDesc = await desc;
+        if (Object.keys(awaitedDesc).length !== 1) {
+          throw new Error(`gn desc returned an object with more than one key`);
+        }
+        const resolvedTarget = awaitedDesc[Object.keys(awaitedDesc)[0]];
+        const { toolchain } = parseGnTargetName(targetName);
+        let mapConfigStrings = !!toolchain ? (x: string) => `${x}(${toolchain})` : (x: string) => x;
+        await Promise.all([
+          ...resolvedTarget.deps || [],
+          ...resolvedTarget.public_deps || [],
+          ...[
+            ...resolvedTarget.configs || [],
+            ...resolvedTarget.public_configs || [],
+            ...resolvedTarget.all_dependent_configs || []
+          ].map(mapConfigStrings)
+        ].map(getSingleTarget));
         return desc;
       };
       // Call the above mentioned helper function for the top-level target,
