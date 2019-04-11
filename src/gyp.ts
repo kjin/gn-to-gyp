@@ -266,7 +266,7 @@ class GypProjectBuilder {
       // TODO Make this more robust.
       sources: (gnTarget.sources || []).map(boundCanonicalizePath),
       dependencies: deps.map(dep => {
-        const { file, target, toolchain } = parseGnTargetName(dep);
+        const { path: file, target, toolchain } = parseGnTargetName(dep);
         return `${gypifyTargetName(`//${file}:${target}`)}#${this.toGypToolset(gnTargetBuildConfig.build, toolchain)}`
       }),
       cflags: gnTarget.cflags || [],
@@ -388,7 +388,7 @@ export class GypProject {
         .getBuild(gnBuildConfig.build)
         .getTarget(gnBuildConfig.toolchain, gnBuildConfig.name);
       const deps = gnTarget.deps.map(dep => {
-        const { file, target, toolchain } = parseGnTargetName(dep);
+        const { path: file, target, toolchain } = parseGnTargetName(dep);
         return {
           name: `//${file}:${target}`,
           build: gnBuildConfig.build,
