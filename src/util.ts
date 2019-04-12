@@ -105,6 +105,7 @@ export function deserializeMap<S, T>(
   return result;
 }
 
+// tslint:disable:no-any
 /**
  * Given an async function and a number X, returns a wrapper for that function
  * with the same API, but ensures that the function is only called with X
@@ -112,14 +113,16 @@ export function deserializeMap<S, T>(
  * @param fn An async function.
  * @param poolSize The pool size.
  */
-export function pool<S extends any[], T>(fn: (...args: S) => Promise<T>, poolSize: number): (...args: S) => Promise<T> {
+export function pool<S extends any[], T>(
+    fn: (...args: S) => Promise<T>, poolSize: number): (...args: S) =>
+    Promise<T> {
   if (poolSize === Infinity) {
     return fn;
   } else if (poolSize <= 0) {
     throw new Error(`pool called with size = ${poolSize}`);
   }
   const pendingPromises: Array<Promise<T>> = [];
-  return async (...args: S): Promise<T> => {
+  return async(...args: S): Promise<T> => {
     while (poolSize <= 0) {
       const preWork = Promise.race(pendingPromises);
       try {
@@ -143,3 +146,4 @@ export function pool<S extends any[], T>(fn: (...args: S) => Promise<T>, poolSiz
     }
   };
 }
+// tslint:enable:no-any

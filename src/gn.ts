@@ -1,4 +1,4 @@
-import {deserializeMap, flatten, removeDuplicates, serializeMap, pool} from './util';
+import {deserializeMap, flatten, pool, removeDuplicates, serializeMap} from './util';
 
 import execa = require('execa');
 import {promises as fs} from 'fs';
@@ -122,8 +122,9 @@ export class GnBuild {
     const result = new GnBuild();
     result.targets =
         deserializeMap(json, k => k, v => JSON.parse(v) as GnTarget);
-    result.toolchains =
-        Array.from(result.targets.values()).map(target => target.toolchain);
+    result.toolchains = Array.from(result.targets.values())
+                            .map(target => target.toolchain)
+                            .reduce(removeDuplicates, [] as string[]);
     // Assume that TARGET_ALL is always built with target toolchain.
     if (!result.targets.has(TARGET_ALL)) {
       throw new Error(`GnBuild has no ${TARGET_ALL} target`);
@@ -218,7 +219,8 @@ export class GnProject {
       const knownTargets: Map<string, Promise<GnDescription>> = new Map();
       // Helper function -- get the `gn desc` for a single target and
       // dependencies, populating knownTargets, which also doubles as a cache.
-      const getSingleTarget = async(targetName: string): Promise<GnDescription> => {
+      const getSingleTarget =
+          async(targetName: string): Promise<GnDescription> => {
         // Don't do any extra processing if we've already seen the target
         // before.
         if (knownTargets.has(targetName)) {
@@ -246,16 +248,16 @@ export class GnProject {
           throw new Error(`gn desc returned an object with more than one key`);
         }
         const resolvedTarget = awaitedDesc[Object.keys(awaitedDesc)[0]];
-        const { toolchain } = parseGnTargetName(targetName);
-        let mapConfigStrings = !!toolchain ? (x: string) => `${x}(${toolchain})` : (x: string) => x;
+        const {toolchain} = parseGnTargetName(targetName);
+        const mapConfigStrings = !!toolchain ?
+            (x: string) => `${x}(${toolchain})` :
+            (x: string) => x;
         await Promise.all([
-          ...resolvedTarget.deps || [],
-          ...resolvedTarget.public_deps || [],
-          ...[
-            ...resolvedTarget.configs || [],
-            ...resolvedTarget.public_configs || [],
-            ...resolvedTarget.all_dependent_configs || []
-          ].map(mapConfigStrings)
+          ...resolvedTarget.deps || [], ...resolvedTarget.public_deps || [],
+          ...[...resolvedTarget.configs || [],
+              ...resolvedTarget.public_configs || [],
+              ...resolvedTarget.all_dependent_configs || []]
+              .map(mapConfigStrings)
         ].map(getSingleTarget));
         return desc;
       };

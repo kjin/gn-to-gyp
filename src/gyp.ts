@@ -1,5 +1,5 @@
 import {GnProject, GnTarget, parseGnTargetName} from './gn';
-import {arrayEquals, getOnlyMappedValue, removeDuplicates, flatten} from './util';
+import {arrayEquals, flatten, getOnlyMappedValue, removeDuplicates} from './util';
 
 /**
  * A message to place at the top of a generated GYP file.
@@ -99,7 +99,7 @@ class GypTargetBuilder {
    * like fields, and placing other fields under conditional blocks predicated
    * on the toolset.
    */
-  private buildTarget(): GypTarget {
+  buildTarget(): GypTarget {
     const builds = Array.from(this.targetFragments.keys());
     let result:
         GypTarget = {target_name: this.targetName, type: this.targetType};
@@ -332,19 +332,27 @@ class GypProjectBuilder {
       private readonly gnRootTargetName: string) {}
 
   /**
-   * Given a GN build and GN toolchain, return a suitable GYP toolset, or throw
-   * if there isn't one.
-   * @param gnBuildName The GN build name.
+   * Given a GN toolchain, return a suitable GYP toolset, or throw if there
+   * isn't one.
    * @param gnToolchain The GN toolchain.
    */
-  private toGypToolset(gnBuildName: string, gnToolchain: string): string {
+  toGypToolset(gnToolchain: string): string {
     if (!gnToolchain) {
-      gnToolchain = this.gnProject.getBuild(gnBuildName).getDefaultToolchain();
+      throw new Error(`Can't resolve toolchain with no information`);
     }
     if (!this.toolchainMap[gnToolchain]) {
       throw new Error(`Unrecognized GN toolchain: ${gnToolchain}`);
     }
     return this.toolchainMap[gnToolchain];
+  }
+
+  private getGenDirectoryForToolset(
+      {toolchain, build}: {toolchain: string, build: string}): string {
+    let outputDir = '<(SHARED_INTERMEDIATE_DIR)';
+    if (toolchain !== this.gnProject.getBuild(build).getDefaultToolchain()) {
+      outputDir += `/${parseGnTargetName(toolchain).target}`;
+    }
+    return outputDir;
   }
 
   /**
@@ -357,121 +365,145 @@ class GypProjectBuilder {
       gnTarget: GnTarget, gnTargetBuildConfig: GnTargetBuildConfig): GypTarget {
     const boundGypifyPath = (path: string) =>
         gypifyPath(gnTargetBuildConfig.build, path);
-    const deps = (gnTarget.deps || []);
-    // Create the list of include dirs.
-    const includeDirs: string[] = [
-      ...(gnTarget.include_dirs || []).map(boundGypifyPath),
-      ...extractIncludes(gnTarget.cflags || [])
-    ].reduce(removeDuplicates, [] as string[]);
+
     // Create the corresponding GYP target.
     const targetName = gypifyTargetName(gnTargetBuildConfig.name);
     if (!gnTarget.type) {
       throw new Error(`GN target ${targetName} has no type.`);
     }
     const targetType = gypifyTargetType(gnTarget.type);
-    const targetToolchain = this.toGypToolset(
-        gnTargetBuildConfig.build, gnTargetBuildConfig.toolchain);
+    const targetToolset = this.toGypToolset(gnTargetBuildConfig.toolchain);
+
     const fragment: GypTarget = {
       target_name: targetName,
       type: targetType,
-      include_dirs: includeDirs,
-      defines: gnTarget.defines || [],
-      // empty.cc is here to satisfy the linker if there are no cc files.
-      // TODO Make this more robust.
-      sources: (gnTarget.sources || []).map(boundGypifyPath),
-      dependencies: deps.map(dep => {
-        const {path: file, target, toolchain} = parseGnTargetName(dep);
-        return `${gypifyTargetName(`//${file}:${target}`)}#${
-            this.toGypToolset(gnTargetBuildConfig.build, toolchain)}`;
-      }),
-      cflags: gnTarget.cflags || [],
-      cflags_cc: gnTarget.cflags_cc || [],
       // Static libraries cannot depend on each other in GYP unless this flag
       // is set to true.
       hard_dependency: 'True',
-      toolsets: [targetToolchain]
+      toolsets: [targetToolset]
     };
-    if (gnTargetBuildConfig.name === this.gnRootTargetName) {
+
+    {  // Dependencies
+      fragment.dependencies = (gnTarget.deps || []).map(dep => {
+        const {path: file, target} = parseGnTargetName(dep);
+        let {toolchain} = parseGnTargetName(dep);
+        if (!toolchain) {
+          toolchain = this.gnProject.getBuild(gnTargetBuildConfig.build)
+                          .getDefaultToolchain();
+        }
+        return `${gypifyTargetName(`//${file}:${target}`)}#${
+            this.toGypToolset(toolchain)}`;
+      });
+    }
+
+    {  // Include Directories
+      const includeDirs: string[] = [
+        ...(gnTarget.include_dirs || []).map(boundGypifyPath),
+        ...extractIncludes(gnTarget.cflags || [])
+      ].reduce(removeDuplicates, [] as string[]);
+      fragment.include_dirs = includeDirs;
+    }
+
+    {  // Defines
+      fragment.defines = gnTarget.defines || [];
+    }
+
+    {  // Sources
+      fragment.sources = (gnTarget.sources || []).map(boundGypifyPath);
+      if (targetType === 'static_library') {
+        // empty.cc is here to satisfy the linker if there are no cc files.
+        // TODO Make this more robust.
+        fragment.sources!.push(`${
+            this.getGenDirectoryForToolset(gnTargetBuildConfig)}/gen/empty.cc`);
+        fragment.dependencies!.push(`gen_empty_cc#${targetToolset}`);
+      }
+    }
+
+    {  // Direct dependency settings
       // TODO(kjin): This is pointless.
-      const build = this.gnProject.getBuild(gnTargetBuildConfig.build);
-      const includeDirs: string[] = (gnTarget.public_configs || [])
-        .map(config => build.getTarget(gnTargetBuildConfig.toolchain, config).deps)
-        .reduce(flatten, [] as string[])
-        .map(boundGypifyPath)
-        .reduce(removeDuplicates, [] as string[]);
-      fragment.direct_dependent_settings = {
-        include_dirs: includeDirs
-      };
+      if (gnTargetBuildConfig.name === this.gnRootTargetName) {
+        const build = this.gnProject.getBuild(gnTargetBuildConfig.build);
+        const includeDirs: string[] =
+            (gnTarget.public_configs || [])
+                .map(
+                    config =>
+                        build.getTarget(gnTargetBuildConfig.toolchain, config)
+                            .deps)
+                .reduce(flatten, [] as string[])
+                .map(boundGypifyPath)
+                .reduce(removeDuplicates, [] as string[]);
+        fragment.direct_dependent_settings = {include_dirs: includeDirs};
+      }
     }
-    if (targetType === 'static_library') {
-      fragment.sources!.push('<(SHARED_INTERMEDIATE_DIR)/empty.cc');
-      fragment.dependencies!.push(`gen_empty_cc#${targetToolchain}`);
+
+    {  // Action
+      switch (gnTarget.type) {
+        case 'action': {
+          if (!gnTarget.script) {
+            throw new Error(
+                `${gnTargetBuildConfig.name} is an action but has no script`);
+          }
+          const metaInputs =
+              [...(gnTarget.inputs || []), ...(gnTarget.sources || [])];
+          fragment.actions = [{
+            action_name: `${targetName}_action`,
+            inputs: metaInputs.map(boundGypifyPath),
+            outputs: (gnTarget.outputs || []).map(boundGypifyPath),
+            action: [
+              ...(gnTarget.script.endsWith('.py') ? ['python'] : []),
+              boundGypifyPath(gnTarget.script!),
+              ...this.correctPathsForScriptArgs(
+                  gnTarget.script, gnTarget.args || [])
+            ]
+          }];
+          break;
+        }
+        case 'action_foreach': {
+          throw new Error(`action_foreach is untested`);
+          // const metaInputs = [
+          //   ...(gnTarget.inputs || []),
+          //   ...(gnTarget.sources || [])
+          // ];
+          // gypTarget.actions = [
+          //   ...metaInputs.map((input, num) => ({
+          //     action_name: `${gypTarget.target_name}_action_${num}`,
+          //     inputs: [canonicalizePath(input)],
+          //     outputs: [],
+          //     action: [
+          //       canonicalizePath(gnTarget.script!),
+          //       ...(gnTarget.args || [])
+          //     ]
+          //   })),
+          //   {
+          //     action_name: `${gypTarget.target_name}_action_final`,
+          //     inputs: [],
+          //     outputs: (gnTarget.outputs || []).map(canonicalizePath),
+          //     action: []
+          //   }
+          // ];
+          // break;
+        }
+        case 'copy': {
+          fragment.actions = [{
+            action_name: `${targetName}_action`,
+            inputs: (gnTarget.sources || []).map(boundGypifyPath),
+            outputs: (gnTarget.outputs || []).map(boundGypifyPath),
+            action: ['cp', '<@(_inputs)', '<@(_outputs)']
+          }];
+          break;
+        }
+        default:
+          break;
+      }
     }
+
     // Apparently libs not allowed in DEBUG.
     // if (gnTarget.libs) {
     //   gypFields.link_settings = {
     //     libraries: gnTarget.libs.map(l => `-l${l}`)
     //   };
     // }
-    // If it exists, attach a GYP action.
-    switch (gnTarget.type) {
-      case 'action': {
-        if (!gnTarget.script) {
-          throw new Error(
-              `${gnTargetBuildConfig.name} is an action but has no script`);
-        }
-        const metaInputs =
-            [...(gnTarget.inputs || []), ...(gnTarget.sources || [])];
-        fragment.actions = [{
-          action_name: `${targetName}_action`,
-          inputs: metaInputs.map(boundGypifyPath),
-          outputs: (gnTarget.outputs || []).map(boundGypifyPath),
-          action: [
-            ...(gnTarget.script.endsWith('.py') ? ['python'] : []),
-            boundGypifyPath(gnTarget.script!),
-            ...this.correctPathsForScriptArgs(
-                gnTarget.script, gnTarget.args || [])
-          ]
-        }];
-        break;
-      }
-      case 'action_foreach': {
-        throw new Error(`action_foreach is untested`);
-        // const metaInputs = [
-        //   ...(gnTarget.inputs || []),
-        //   ...(gnTarget.sources || [])
-        // ];
-        // gypTarget.actions = [
-        //   ...metaInputs.map((input, num) => ({
-        //     action_name: `${gypTarget.target_name}_action_${num}`,
-        //     inputs: [canonicalizePath(input)],
-        //     outputs: [],
-        //     action: [
-        //       canonicalizePath(gnTarget.script!),
-        //       ...(gnTarget.args || [])
-        //     ]
-        //   })),
-        //   {
-        //     action_name: `${gypTarget.target_name}_action_final`,
-        //     inputs: [],
-        //     outputs: (gnTarget.outputs || []).map(canonicalizePath),
-        //     action: []
-        //   }
-        // ];
-        // break;
-      }
-      case 'copy': {
-        fragment.actions = [{
-          action_name: `${targetName}_action`,
-          inputs: (gnTarget.sources || []).map(boundGypifyPath),
-          outputs: (gnTarget.outputs || []).map(boundGypifyPath),
-          action: ['cp', '<@(_inputs)', '<@(_outputs)']
-        }];
-        break;
-      }
-      default:
-        break;
-    }
+
     return fragment;
   }
 
@@ -484,6 +516,7 @@ class GypProjectBuilder {
    */
   toGypTargets(gnTargetBuildConfigs: GnTargetBuildConfig[]): GypTarget[] {
     const targetBuilder = new GypTargetBuilder();
+    // TODO(kjin): Right now we filter non-mac_debug builds.
     gnTargetBuildConfigs
         .filter(
             gnTargetBuildConfig => gnTargetBuildConfig.build === 'mac_debug')
@@ -500,6 +533,35 @@ class GypProjectBuilder {
           targetBuilder.addTargetFragment(fragment, outputs);
         });
     return targetBuilder.buildWithProxy();
+  }
+
+  /**
+   * Create a target that generates an empty.cc file. This file is used as a
+   * dummy file to satisfy the linker when no other *.cc files are present in
+   * a static_library target.
+   */
+  generateEmptyCCTarget(): GypTarget {
+    const emptyCCTarget = new GypTargetBuilder();
+    for (const build of this.gnProject.getBuildNames()) {
+      // TODO(kjin): Right now we filter non-mac_debug builds.
+      if (build !== 'mac_debug') continue;
+      for (const toolchain of this.gnProject.getBuild(build).getToolchains()) {
+        const output = `${
+            this.getGenDirectoryForToolset({build, toolchain})}/gen/empty.cc`;
+        emptyCCTarget.addTargetFragment({
+          target_name: 'gen_empty_cc',
+          type: 'none',
+          actions: [{
+            action_name: 'gen_empty_cc_action',
+            inputs: [],
+            outputs: [output],
+            action: ['touch', output]
+          }],
+          toolsets: [this.toGypToolset(toolchain)]
+        });
+      }
+    }
+    return emptyCCTarget.buildTarget();
   }
 }
 
@@ -573,29 +635,14 @@ export class GypProject {
     const gnTargetDepNames: string[] =
         gnTargetDeps.map(dep => dep.name)
             .reduce(removeDuplicates, [] as string[]);
-    const projectBuilder =
-        new GypProjectBuilder(gnProject, correctPathsForScriptArgs, gnRootTarget);
+    const projectBuilder = new GypProjectBuilder(
+        gnProject, correctPathsForScriptArgs, gnRootTarget);
     for (const gnTargetDepName of gnTargetDepNames) {
       const gypTargets = projectBuilder.toGypTargets(gnTargetDeps.filter(
           gnTargetDep => gnTargetDep.name === gnTargetDepName));
       result.targets.push(...gypTargets);
     }
-    // Create a dummy empty.cc file action.
-    const emptyCCTarget = new GypTargetBuilder();
-    for (const toolset of ['host', 'target']) {
-      emptyCCTarget.addTargetFragment({
-        target_name: 'gen_empty_cc',
-        type: 'none',
-        actions: [{
-          action_name: 'gen_empty_cc_action',
-          inputs: [],
-          outputs: ['<(SHARED_INTERMEDIATE_DIR)/empty.cc'],
-          action: ['touch', '<(SHARED_INTERMEDIATE_DIR)/empty.cc']
-        }],
-        toolsets: [toolset]
-      });
-    }
-    result.targets.push(...emptyCCTarget.buildWithProxy());
+    result.targets.push(projectBuilder.generateEmptyCCTarget());
     return result;
   }
 }

@@ -58,7 +58,7 @@ async function main(args: string[]) {
   const result = GypProject.fromGnProject(
       gnProject, correctPathsForScriptArgs, '//:libperfetto');
   await fs.writeFile(
-      `${perfettoDir}/gypfiles/perfetto.gyp`, result.toGypFile());
+      `${perfettoDir}/gypfiles/perfetto_gen.gypi`, result.toGypFile());
 
   // const lib = 'perfetto';
   // try {
