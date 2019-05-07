@@ -122,9 +122,8 @@ export class GnBuild {
     const result = new GnBuild();
     result.targets =
         deserializeMap(json, k => k, v => JSON.parse(v) as GnTarget);
-    result.toolchains = Array.from(result.targets.values())
-                            .map(target => target.toolchain)
-                            .reduce(removeDuplicates, [] as string[]);
+    result.toolchains =
+        Array.from(result.targets.values()).map(target => target.toolchain).reduce(removeDuplicates, [] as string[]);
     // Assume that TARGET_ALL is always built with target toolchain.
     if (!result.targets.has(TARGET_ALL)) {
       throw new Error(`GnBuild has no ${TARGET_ALL} target`);

@@ -60,23 +60,23 @@ async function main(args: string[]) {
   await fs.writeFile(
       `${perfettoDir}/gypfiles/perfetto_gen.gypi`, result.toGypFile());
 
-  // const lib = 'perfetto';
-  // try {
-  //   await execa(gypPath, [
-  //     '-f', 'make',
-  //     `/Users/kelvinjin/src/node-ci/node-ci/node/deps/${lib}/gypfiles/${
-  //         lib}.gyp`,
-  //     '-I', '/Users/kelvinjin/src/node-ci/node-ci/node/common.gypi', '-I',
-  //     '/Users/kelvinjin/src/node-ci/node-ci/node/config.gypi', '--depth=.',
-  //     '--generator-output', '/Users/kelvinjin/src/node-ci/node-ci/node/out',
-  //     '-Goutput_dir=/Users/kelvinjin/src/node-ci/node-ci/node/out',
-  //     '-Dcomponent=static_library', '-Dlibrary=static_library',
-  //     '-Dlinux_use_bundled_binutils=0', '-Dlinux_use_bundled_gold=0',
-  //     '-Dlinux_use_gold_flags=0'
-  //   ]);
-  // } catch (e) {
-  //   console.error(e.stderr);
-  // }
+  const lib = 'perfetto';
+  try {
+    await execa(gypPath, [
+      '-f', 'make',
+      `/Users/kelvinjin/src/node-ci/node-ci/node/deps/${lib}/gypfiles/${
+          lib}.gyp`,
+      '-I', '/Users/kelvinjin/src/node-ci/node-ci/node/common.gypi', '-I',
+      '/Users/kelvinjin/src/node-ci/node-ci/node/config.gypi', '--depth=.',
+      '--generator-output', '/Users/kelvinjin/src/node-ci/node-ci/node/out',
+      '-Goutput_dir=/Users/kelvinjin/src/node-ci/node-ci/node/out',
+      '-Dcomponent=static_library', '-Dlibrary=static_library',
+      '-Dlinux_use_bundled_binutils=0', '-Dlinux_use_bundled_gold=0',
+      '-Dlinux_use_gold_flags=0'
+    ], { cwd: `${__dirname}/../..` });
+  } catch (e) {
+    console.error(e.stderr);
+  }
 }
 
 main(process.argv.slice(2)).catch(console.error);

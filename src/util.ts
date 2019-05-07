@@ -38,6 +38,19 @@ export function removeDuplicates<T>(arr: T[], e: T) {
   return arr;
 }
 
+export function splitByMappedValue<T>(
+  arr: T[], fn: (arg: T) => {}): {[k: string]: T[]} {
+  const result: {[k: string]: T[]} = {};
+  for (const arg of arr) {
+    const key = `${fn(arg)}`;
+    if (!result[key]) {
+      result[key] = [];
+    }
+    result[key].push(arg);
+  }
+  return result;
+}
+
 /**
  * Returns whether two arrays are equal.
  * @param a The first array.

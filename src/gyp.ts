@@ -138,6 +138,9 @@ class GypTargetBuilder {
       result.target_conditions = builds.map(build => {
         const targetForBuild =
             Object.assign({}, this.targetFragments.get(build)!);
+        delete targetForBuild.target_name;
+        delete targetForBuild.type;
+        delete targetForBuild.toolsets;
         delete targetForBuild.dependencies;
         delete targetForBuild.outputs;
         return [`_toolset=="${build}"`, targetForBuild] as [string, GypFields];
@@ -152,10 +155,8 @@ class GypTargetBuilder {
    * to a location expected by other targets. This is needed because GYP doesn't
    * allow setting the output path of an executable while GN does.
    */
-  private buildProxy(): GypTarget {
-    if (this.targetType !== 'executable') {
-      throw new Error('Proxies only make sense for executables');
-    }
+  private buildProxyForExecutableTarget(mainTarget: GypTarget): GypTarget {
+    mainTarget.target_name = `${this.targetName}_proxy`;
     const builds = Array.from(this.targetFragments.keys());
     const actionsForBuilds: GypFields[] = builds.map(build => {
       const outputs = this.targetFragments.get(build)!.outputs;
@@ -165,7 +166,7 @@ class GypTargetBuilder {
       }
       return {
         actions: [{
-          action_name: `move_as_expected_output`,
+          action_name: `copy_as_expected_output`,
           action: [
             'cp',
             '<@(_inputs)',
@@ -195,6 +196,23 @@ class GypTargetBuilder {
   }
 
   /**
+   * Create a GYP target that copies an executable from its default GYP path,
+   * to a location expected by other targets. This is needed because GYP doesn't
+   * allow setting the output path of an executable while GN does.
+   */
+  private buildProxyForStaticLibraryTarget(mainTarget: GypTarget): GypTarget {
+    mainTarget.target_name = `${this.targetName}_proxy`;
+    const builds = Array.from(this.targetFragments.keys());
+    const result: GypTarget = {
+      target_name: this.targetName,
+      type: 'none',
+      dependencies: [`${this.targetName}_proxy`],
+      toolsets: builds
+    };
+    return result;
+  }
+
+  /**
    * Build at least one GYP target based on previously added target fragments.
    * It will be exactly one target unless the target is of type 'executable',
    * in which case there will be two targets:
@@ -209,9 +227,14 @@ class GypTargetBuilder {
     }
     const mainTarget = this.buildTarget();
     if (this.targetType === 'executable') {
-      mainTarget.target_name = `${this.targetName}_proxy`;
-      const proxyTarget = this.buildProxy();
+      const proxyTarget = this.buildProxyForExecutableTarget(mainTarget);
       return [mainTarget, proxyTarget];
+    } else if (this.targetType === 'static_library') {
+      mainTarget.target_name = `${this.targetName}_proxy`;
+      const proxyTarget = this.buildProxyForStaticLibraryTarget(mainTarget);
+      return [mainTarget, proxyTarget];
+      // mainTarget.hard_dependency = 'True';
+      // return [mainTarget];
     } else {
       return [mainTarget];
     }
@@ -365,6 +388,14 @@ class GypProjectBuilder {
       gnTarget: GnTarget, gnTargetBuildConfig: GnTargetBuildConfig): GypTarget {
     const boundGypifyPath = (path: string) =>
         gypifyPath(gnTargetBuildConfig.build, path);
+    const boundParseGnTargetName = (dep: string) => {
+      const parsedGnTargetName = parseGnTargetName(dep);
+      if (!parsedGnTargetName.toolchain) {
+        parsedGnTargetName.toolchain = this.gnProject.getBuild(gnTargetBuildConfig.build)
+                        .getDefaultToolchain();
+      }
+      return parsedGnTargetName;
+    };
 
     // Create the corresponding GYP target.
     const targetName = gypifyTargetName(gnTargetBuildConfig.name);
@@ -379,19 +410,61 @@ class GypProjectBuilder {
       type: targetType,
       // Static libraries cannot depend on each other in GYP unless this flag
       // is set to true.
-      hard_dependency: 'True',
+      // hard_dependency: 'True',
       toolsets: [targetToolset]
     };
 
     {  // Dependencies
-      fragment.dependencies = (gnTarget.deps || []).map(dep => {
-        const {path: file, target} = parseGnTargetName(dep);
-        let {toolchain} = parseGnTargetName(dep);
-        if (!toolchain) {
-          toolchain = this.gnProject.getBuild(gnTargetBuildConfig.build)
-                          .getDefaultToolchain();
+      let gnDepNames: string[] = [];
+      const getDep = (gnDepName: string) => {
+        const {path, target, toolchain} = boundParseGnTargetName(gnDepName);
+        const gnDep = this.gnProject.getBuild(gnTargetBuildConfig.build)
+          .getTarget(toolchain, `//${path}:${target}`);
+        return gnDep;
+      };
+      switch (gnTarget.type) {
+        // case 'static_library':
+        // case 'source_set': {
+        //   // If we are a source set, shed dependencies on other static libs,
+        //   // inheriting its non-static deps instead.
+        //   let baseGnDepNames = gnTarget.deps || [];
+        //   while (baseGnDepNames.length > 0) {
+        //     gnDepNames.push(...baseGnDepNames.filter(gnDepName => {
+        //       const gnDep = getDep(gnDepName);
+        //       return gnDep.type !== 'source_set' && gnDep.type !== 'static_library';
+        //     }));
+        //     baseGnDepNames = baseGnDepNames.map(gnDepName => getDep(gnDepName))
+        //       .filter(gnDep => gnDep.type !== 'source_set' && gnDep.type !== 'static_library')
+        //       .map(gnDep => gnDep.deps)
+        //       .reduce(flatten, [] as string[])
+        //       .reduce(removeDuplicates, [] as string[]);
+        //   }
+        //   gnDepNames = gnDepNames.reduce(removeDuplicates, [] as string[]);
+        //   break;
+        // }
+        // case 'shared_library':
+        // case 'executable': {
+        //   // If we are one of the above, do basically the opposite of the above.
+        //   let baseGnDepNames = gnTarget.deps || [];
+        //   while (baseGnDepNames.length > 0) {
+        //     gnDepNames.push(...baseGnDepNames);
+        //     baseGnDepNames = baseGnDepNames.map(gnDepName => getDep(gnDepName))
+        //       .filter(gnDep => gnDep.type === 'source_set')
+        //       .map(gnDep => gnDep.deps)
+        //       .reduce(flatten, [] as string[])
+        //       .reduce(removeDuplicates, [] as string[]);
+        //   }
+        //   gnDepNames = gnDepNames.reduce(removeDuplicates, [] as string[]);
+        //   break;
+        // }
+        default: {
+          gnDepNames.push(...gnTarget.deps || []);
+          break;
         }
-        return `${gypifyTargetName(`//${file}:${target}`)}#${
+      }
+      fragment.dependencies = gnDepNames.map(gnDep => {
+        const {path, target, toolchain} = boundParseGnTargetName(gnDep);
+        return `${gypifyTargetName(`//${path}:${target}`)}#${
             this.toGypToolset(toolchain)}`;
       });
     }
@@ -555,7 +628,7 @@ class GypProjectBuilder {
             action_name: 'gen_empty_cc_action',
             inputs: [],
             outputs: [output],
-            action: ['touch', output]
+            action: ['touch', '-a', output]
           }],
           toolsets: [this.toGypToolset(toolchain)]
         });
