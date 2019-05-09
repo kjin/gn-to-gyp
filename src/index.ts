@@ -7,7 +7,9 @@ import {GypProject} from './gyp';
 function correctPathsForScriptArgs(script: string, args: string[]): string[] {
   if (script === '//gn/standalone/build_tool_wrapper.py') {
     return args.map(arg => {
-      if (arg.startsWith('../')) {
+      if (arg.startsWith('../../')) {
+        return `<(root_relative_to_gypfile)/${arg.slice(6)}`;
+      } else if (arg.startsWith('../')) {
         return arg.slice(3);
       } else if (arg.startsWith('--')) {
         arg = arg.replace(
@@ -23,6 +25,13 @@ function correctPathsForScriptArgs(script: string, args: string[]): string[] {
   } else {
     throw new Error('unknown script ' + script);
   }
+}
+
+// specific for Perfetto
+function correctPathForCFlagInclude(include: string): string {
+  // Every include seems to be relative to a two-level deep directory.
+  // For the purposes of building, lop one layer of depth off.
+  return include.slice('../'.length);
 }
 
 async function main(args: string[]) {
@@ -56,9 +65,41 @@ async function main(args: string[]) {
 
   // Write the gyp file
   const result = GypProject.fromGnProject(
-      gnProject, correctPathsForScriptArgs, '//:libperfetto');
+      gnProject, {
+        correctPathsForScriptArgs,
+        correctPathForCFlagInclude,
+        gnRootTargetName: '//:libperfetto',
+        subprojects: [{
+          name: 'protobuf',
+          file: 'protobuf.gyp',
+          predicate: (targetName) => {
+            return targetName.startsWith('//buildtools:proto');
+          },
+          // setNewName: (targetName: string) => {
+          //   // if (targetName.startsWith('buildtools_')) {
+          //   //   return targetName.slice('buildtools_'.length);
+          //   // }
+          //   return targetName;
+          // },
+          setNewPath: (path: string) => {
+            return path.replace('<(root_relative_to_gypfile)/buildtools/protobuf/', `<(root_relative_to_gypfile)/../protobuf/`);
+          }
+        },
+        {
+          name: 'perfetto',
+          file: 'perfetto_gen.gypi',
+          predicate: (targetName) => !targetName.startsWith('//buildtools:proto'),
+          // setNewName: (x: string) => x,
+          setNewPath: (x: string) => x
+        }]
+      });
+  // const { perfetto, protobuf } = result.split();
   await fs.writeFile(
-      `${perfettoDir}/gypfiles/perfetto_gen.gypi`, result.toGypFile());
+      `${perfettoDir}/gypfiles/perfetto_gen.gypi`, result.toGypFile('perfetto'));
+  await fs.writeFile(
+    `${perfettoDir}/gypfiles/protobuf.gyp`, result.toGypFile('protobuf'));
+    await fs.writeFile(
+      `${perfettoDir}/gypfiles/empty.gyp`, result.toGypFile('empty'));
 
   const lib = 'perfetto';
   try {

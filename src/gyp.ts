@@ -297,7 +297,7 @@ function gypifyPath(gnBuildName: string, gnPath: string): string {
   if (gnPath.startsWith(outPrefix)) {
     return `<(SHARED_INTERMEDIATE_DIR)/${gnPath.slice(outPrefix.length)}`;
   } else if (gnPath.startsWith('//')) {
-    return `../${gnPath.slice(2)}`;
+    return `<(root_relative_to_gypfile)/${gnPath.slice(2)}`;
   }
   throw new Error(`Unexpected path: ${gnPath}`);
 }
@@ -313,9 +313,7 @@ function extractIncludes(cflags: string[]): string[] {
       if (i + 1 === cflags.length) {
         throw new Error(`Unexpected value for last cflag: ${cflags[i]}`);
       }
-      // Every include seems to be relative to a two-level deep directory.
-      // For the purposes of building, lop one layer of depth off.
-      result.push(cflags[i + 1].slice('../'.length));
+      result.push(cflags[i + 1]);
     }
   }
   return result;
@@ -328,31 +326,56 @@ function extractIncludes(cflags: string[]): string[] {
  */
 export type CorrectPathsForScriptArgs = (script: string, args: string[]) =>
     string[];
+/**
+ * A function that describes how include paths in cflags should be corrected.
+ * This is project-dependent.
+ */
+export type CorrectPathForCFlagInclude = (include: string) => string;
+export type GypProjectOptions = {
+  /**
+   * A function describing how path arguments to scripts should be corrected.
+   */
+  correctPathsForScriptArgs: CorrectPathsForScriptArgs;
+  /**
+   * A function that describes how include paths in cflags should be corrected.
+   */
+  correctPathForCFlagInclude: CorrectPathForCFlagInclude;
+  /**
+   * The root target that will be processed. This info is important because for
+   * the root target, also specify public configuration. Child targets don't
+   * need this because their public configurations are already reflected in
+   * their parents as a result of `gn desc`.
+   */
+  gnRootTargetName: string;
+  subprojects: GypProjectSplitOptions[];
+};
+
+export type GypProjectSplitOptions = {
+  name: string,
+  file: string;
+  predicate: (gnTargetName: string) => boolean;
+  setNewPath: (path: string) => string;
+  // rootRelativeToGypFile: string;
+}
 
 /**
  * A helper class that can build a GYP project from a GN project.
  */
 class GypProjectBuilder {
-  private readonly toolchainMap: {[k: string]: string} = {
+  private static readonly ignoreTargets = (targetName: string) => {
+    return targetName.startsWith('//gn') && !targetName.startsWith('//gn:protoc');
+  };
+  private static readonly toolchainMap: {[k: string]: string} = {
     '//gn/standalone/toolchain:gcc_like_host': 'host',
     '//gn/standalone/toolchain:gcc_like': 'target'
   };
 
   /**
    * Construct a new GypProjectBuilder instance.
-   * @param gnProject The GN project.
-   * @param correctPathsForScriptArgs A function describing how path arguments
-   * to scripts should be corrected.
-   * @param gnRootTargetName The root target that will be processed. This info
-   * is important because for the root target, also specify public
-   * configuration. Child targets don't need this because their public
-   * configurations are already reflected in their parents as a result of
-   * `gn desc`.
    */
   constructor(
-      private readonly gnProject: GnProject,
-      private readonly correctPathsForScriptArgs: CorrectPathsForScriptArgs,
-      private readonly gnRootTargetName: string) {}
+    private readonly gnProject: GnProject,
+    private readonly options: GypProjectOptions) {}
 
   /**
    * Given a GN toolchain, return a suitable GYP toolset, or throw if there
@@ -363,10 +386,10 @@ class GypProjectBuilder {
     if (!gnToolchain) {
       throw new Error(`Can't resolve toolchain with no information`);
     }
-    if (!this.toolchainMap[gnToolchain]) {
+    if (!GypProjectBuilder.toolchainMap[gnToolchain]) {
       throw new Error(`Unrecognized GN toolchain: ${gnToolchain}`);
     }
-    return this.toolchainMap[gnToolchain];
+    return GypProjectBuilder.toolchainMap[gnToolchain];
   }
 
   private getGenDirectoryForToolset(
@@ -378,6 +401,21 @@ class GypProjectBuilder {
     return outputDir;
   }
 
+  private getSubproject(name: string) {
+    const matchingSubprojects = this.options.subprojects.filter(subProject => subProject.predicate(name));
+    if (matchingSubprojects.length !== 1) {
+      throw new Error(`Expected ${name} to belong to one subproject but it belongs to multiple.`);
+    }
+    return matchingSubprojects[0];
+  }
+
+  private applySubprojectPathTransforms(path: string): string {
+    for (const subproject of this.options.subprojects) {
+      path = subproject.setNewPath(path);
+    }
+    return path;
+  }
+
   /**
    * Given a GN target and additional information about it not contained within
    * the target, create a GYP target "fragment".
@@ -385,9 +423,9 @@ class GypProjectBuilder {
    * @param gnTargetBuildConfig Additional information about the GN target.
    */
   private toGypTargetFragment(
-      gnTarget: GnTarget, gnTargetBuildConfig: GnTargetBuildConfig): GypTarget {
+      subprojectName: string, gnTarget: GnTarget, gnTargetBuildConfig: GnTargetBuildConfig): GypTarget {
     const boundGypifyPath = (path: string) =>
-        gypifyPath(gnTargetBuildConfig.build, path);
+        this.applySubprojectPathTransforms(gypifyPath(gnTargetBuildConfig.build, path));
     const boundParseGnTargetName = (dep: string) => {
       const parsedGnTargetName = parseGnTargetName(dep);
       if (!parsedGnTargetName.toolchain) {
@@ -462,17 +500,34 @@ class GypProjectBuilder {
           break;
         }
       }
-      fragment.dependencies = gnDepNames.map(gnDep => {
-        const {path, target, toolchain} = boundParseGnTargetName(gnDep);
-        return `${gypifyTargetName(`//${path}:${target}`)}#${
-            this.toGypToolset(toolchain)}`;
-      });
+      fragment.dependencies = gnDepNames
+        .filter(name => !GypProjectBuilder.ignoreTargets(name))
+        .map(gnDep => {
+          const {path, target, toolchain} = boundParseGnTargetName(gnDep);
+          // Get which GYP subproject this belongs to.
+          const subproject = this.getSubproject(`//${path}:${target}`);
+          let prefix = '';
+          if (subproject.name !== subprojectName) {
+            prefix = `${subproject.file}:`;
+          }
+          return `${prefix}${gypifyTargetName(`//${path}:${target}`)}#${
+              this.toGypToolset(toolchain)}`;
+        });
     }
 
     {  // Include Directories
       const includeDirs: string[] = [
         ...(gnTarget.include_dirs || []).map(boundGypifyPath),
         ...extractIncludes(gnTarget.cflags || [])
+          .map(this.options.correctPathForCFlagInclude)
+          .map((path) => {
+            if (path.startsWith('../')) {
+              return `<(root_relative_to_gypfile)/${path.slice('../'.length)}`;
+            } else {
+              return path;
+            }
+          })
+          .map(path => this.applySubprojectPathTransforms(path))
       ].reduce(removeDuplicates, [] as string[]);
       fragment.include_dirs = includeDirs;
     }
@@ -482,30 +537,16 @@ class GypProjectBuilder {
     }
 
     {  // Sources
-      fragment.sources = (gnTarget.sources || []).map(boundGypifyPath);
+      fragment.sources = (gnTarget.sources || [])
+        .map(boundGypifyPath);
       if (targetType === 'static_library') {
         // empty.cc is here to satisfy the linker if there are no cc files.
         // TODO Make this more robust.
-        fragment.sources!.push(`${
-            this.getGenDirectoryForToolset(gnTargetBuildConfig)}/gen/empty.cc`);
-        fragment.dependencies!.push(`gen_empty_cc#${targetToolset}`);
-      }
-    }
-
-    {  // Direct dependency settings
-      // TODO(kjin): This is pointless.
-      if (gnTargetBuildConfig.name === this.gnRootTargetName) {
-        const build = this.gnProject.getBuild(gnTargetBuildConfig.build);
-        const includeDirs: string[] =
-            (gnTarget.public_configs || [])
-                .map(
-                    config =>
-                        build.getTarget(gnTargetBuildConfig.toolchain, config)
-                            .deps)
-                .reduce(flatten, [] as string[])
-                .map(boundGypifyPath)
-                .reduce(removeDuplicates, [] as string[]);
-        fragment.direct_dependent_settings = {include_dirs: includeDirs};
+        if (!fragment.sources!.some(source => source.endsWith('.cc'))) {
+          fragment.sources!.push(`${
+              this.getGenDirectoryForToolset(gnTargetBuildConfig)}/gen/empty.cc`);
+          fragment.dependencies!.push(`./empty.gyp:gen_empty_cc#${targetToolset}`);
+        }
       }
     }
 
@@ -525,7 +566,7 @@ class GypProjectBuilder {
             action: [
               ...(gnTarget.script.endsWith('.py') ? ['python'] : []),
               boundGypifyPath(gnTarget.script!),
-              ...this.correctPathsForScriptArgs(
+              ...this.options.correctPathsForScriptArgs(
                   gnTarget.script, gnTarget.args || [])
             ]
           }];
@@ -587,7 +628,17 @@ class GypProjectBuilder {
    * toolchain and build name combinations. The "name" field should be the same
    * across all values.
    */
-  toGypTargets(gnTargetBuildConfigs: GnTargetBuildConfig[]): GypTarget[] {
+  toGypTargets(splitName: string, gnTargetBuildConfigs: GnTargetBuildConfig[]): GypTarget[] {
+    if (gnTargetBuildConfigs.length === 0) {
+      throw new Error('Input is length 0');
+    }
+    const name = gnTargetBuildConfigs[0].name;
+    if (gnTargetBuildConfigs.some(e => e.name !== name)) {
+      throw new Error('Name isn\'t the same across all elements');
+    }
+    if (GypProjectBuilder.ignoreTargets(name)) {
+      return [];
+    }
     const targetBuilder = new GypTargetBuilder();
     // TODO(kjin): Right now we filter non-mac_debug builds.
     gnTargetBuildConfigs
@@ -599,7 +650,7 @@ class GypProjectBuilder {
                   .getTarget(
                       gnTargetBuildConfig.toolchain, gnTargetBuildConfig.name);
           const fragment =
-              this.toGypTargetFragment(gnTarget, gnTargetBuildConfig);
+              this.toGypTargetFragment(splitName, gnTarget, gnTargetBuildConfig);
           const outputs =
               (gnTarget.outputs ||
                []).map(output => gypifyPath(gnTargetBuildConfig.build, output));
@@ -642,13 +693,24 @@ class GypProjectBuilder {
  * A class representing a GYP project.
  */
 export class GypProject {
-  private targets: GypTarget[] = [];
+  private data: Array<{
+    name: string;
+    file: string;
+    targets: GypTarget[];
+  }> = [];
 
   /**
    * Create a GYP build file from this instance.
    */
-  toGypFile(): string {
-    return `# ${GEN_MSG}\n${JSON.stringify({targets: this.targets}, null, 2)}`;
+  toGypFile(name: string): string {
+    const subproject = this.data.find(s => s.name === name);
+    if (!subproject) {
+      throw new Error(`Subproject ${name} doesn't exist.`);
+    }
+    return `# ${GEN_MSG}\n${JSON.stringify({
+      variables: { root_relative_to_gypfile: '..' },
+      targets: subproject.targets
+    }, null, 2)}`;
   }
 
   /**
@@ -700,22 +762,33 @@ export class GypProject {
    */
   static fromGnProject(
       gnProject: GnProject,
-      correctPathsForScriptArgs: CorrectPathsForScriptArgs,
-      gnRootTarget: string): GypProject {
+      options: GypProjectOptions): GypProject {
     const result = new GypProject();
     // Get the exact list of dependencies needed.
-    const gnTargetDeps = GypProject.getAllGnTargetDeps(gnProject, gnRootTarget);
+    const gnTargetDeps = GypProject.getAllGnTargetDeps(gnProject, options.gnRootTargetName);
     const gnTargetDepNames: string[] =
         gnTargetDeps.map(dep => dep.name)
             .reduce(removeDuplicates, [] as string[]);
-    const projectBuilder = new GypProjectBuilder(
-        gnProject, correctPathsForScriptArgs, gnRootTarget);
-    for (const gnTargetDepName of gnTargetDepNames) {
-      const gypTargets = projectBuilder.toGypTargets(gnTargetDeps.filter(
-          gnTargetDep => gnTargetDep.name === gnTargetDepName));
-      result.targets.push(...gypTargets);
+    const projectBuilder = new GypProjectBuilder(gnProject, options);
+    for (const subproject of options.subprojects) {
+      const filteredGnTargetDepNames = gnTargetDepNames.filter(subproject.predicate);
+      const targets = [];
+      for (const gnTargetDepName of filteredGnTargetDepNames) {
+        const gypTargets = projectBuilder.toGypTargets(subproject.name, gnTargetDeps.filter(
+            gnTargetDep => gnTargetDep.name === gnTargetDepName));
+        targets.push(...gypTargets)
+      }
+      result.data.push({
+        name: subproject.name,
+        file: subproject.file,
+        targets: [...targets]
+      });
     }
-    result.targets.push(projectBuilder.generateEmptyCCTarget());
+    result.data.push({
+      name: 'empty',
+      file: 'empty.gyp',
+      targets: [projectBuilder.generateEmptyCCTarget()]
+    });
     return result;
   }
 }
