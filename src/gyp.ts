@@ -440,8 +440,8 @@ class GypProjectBuilder {
     if (!gnTarget.type) {
       throw new Error(`GN target ${targetName} has no type.`);
     }
-    const targetType = gypifyTargetType(gnTarget.type);
     const targetToolset = this.toGypToolset(gnTargetBuildConfig.toolchain);
+    let targetType = gypifyTargetType(gnTarget.type);
 
     const fragment: GypTarget = {
       target_name: targetName,
@@ -452,55 +452,20 @@ class GypProjectBuilder {
       toolsets: [targetToolset]
     };
 
-    {  // Dependencies
-      let gnDepNames: string[] = [];
-      const getDep = (gnDepName: string) => {
-        const {path, target, toolchain} = boundParseGnTargetName(gnDepName);
-        const gnDep = this.gnProject.getBuild(gnTargetBuildConfig.build)
-          .getTarget(toolchain, `//${path}:${target}`);
-        return gnDep;
-      };
-      switch (gnTarget.type) {
-        // case 'static_library':
-        // case 'source_set': {
-        //   // If we are a source set, shed dependencies on other static libs,
-        //   // inheriting its non-static deps instead.
-        //   let baseGnDepNames = gnTarget.deps || [];
-        //   while (baseGnDepNames.length > 0) {
-        //     gnDepNames.push(...baseGnDepNames.filter(gnDepName => {
-        //       const gnDep = getDep(gnDepName);
-        //       return gnDep.type !== 'source_set' && gnDep.type !== 'static_library';
-        //     }));
-        //     baseGnDepNames = baseGnDepNames.map(gnDepName => getDep(gnDepName))
-        //       .filter(gnDep => gnDep.type !== 'source_set' && gnDep.type !== 'static_library')
-        //       .map(gnDep => gnDep.deps)
-        //       .reduce(flatten, [] as string[])
-        //       .reduce(removeDuplicates, [] as string[]);
-        //   }
-        //   gnDepNames = gnDepNames.reduce(removeDuplicates, [] as string[]);
-        //   break;
-        // }
-        // case 'shared_library':
-        // case 'executable': {
-        //   // If we are one of the above, do basically the opposite of the above.
-        //   let baseGnDepNames = gnTarget.deps || [];
-        //   while (baseGnDepNames.length > 0) {
-        //     gnDepNames.push(...baseGnDepNames);
-        //     baseGnDepNames = baseGnDepNames.map(gnDepName => getDep(gnDepName))
-        //       .filter(gnDep => gnDep.type === 'source_set')
-        //       .map(gnDep => gnDep.deps)
-        //       .reduce(flatten, [] as string[])
-        //       .reduce(removeDuplicates, [] as string[]);
-        //   }
-        //   gnDepNames = gnDepNames.reduce(removeDuplicates, [] as string[]);
-        //   break;
-        // }
-        default: {
-          gnDepNames.push(...gnTarget.deps || []);
-          break;
+    {  // Root target custom override.
+      if (gnTargetBuildConfig.name === this.options.gnRootTargetName) {
+        if (targetType !== 'shared_library' && targetType !== 'static_library') {
+          // Not sure what to do yet when the specified root target is not
+          // a shared or static library.
+          throw new Error('Root target must be a shared or static library.');
         }
+        fragment.type = '<(library)';
+        targetType = 'static_library';
       }
-      fragment.dependencies = gnDepNames
+    }
+
+    {  // Dependencies
+      fragment.dependencies = gnTarget.deps
         .filter(name => !GypProjectBuilder.ignoreTargets(name))
         .map(gnDep => {
           const {path, target, toolchain} = boundParseGnTargetName(gnDep);
@@ -541,7 +506,7 @@ class GypProjectBuilder {
         .map(boundGypifyPath);
       if (targetType === 'static_library') {
         // empty.cc is here to satisfy the linker if there are no cc files.
-        // TODO Make this more robust.
+        // TODO: Make this more robust.
         if (!fragment.sources!.some(source => source.endsWith('.cc'))) {
           fragment.sources!.push(`${
               this.getGenDirectoryForToolset(gnTargetBuildConfig)}/gen/empty.cc`);

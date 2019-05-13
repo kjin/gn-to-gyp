@@ -6,7 +6,7 @@ import {GypProject} from './gyp';
 // specific for Perfetto
 function correctPathsForScriptArgs(script: string, args: string[]): string[] {
   if (script === '//gn/standalone/build_tool_wrapper.py') {
-    return args.map(arg => {
+    let result = args.map(arg => {
       if (arg.startsWith('../../')) {
         return `<(root_relative_to_gypfile)/${arg.slice(6)}`;
       } else if (arg.startsWith('../')) {
@@ -22,6 +22,7 @@ function correctPathsForScriptArgs(script: string, args: string[]): string[] {
         return `<(SHARED_INTERMEDIATE_DIR)/${arg}`;
       }
     });
+    return result;
   } else {
     throw new Error('unknown script ' + script);
   }
@@ -31,6 +32,9 @@ function correctPathsForScriptArgs(script: string, args: string[]): string[] {
 function correctPathForCFlagInclude(include: string): string {
   // Every include seems to be relative to a two-level deep directory.
   // For the purposes of building, lop one layer of depth off.
+  if (include === '../../buildtools/googletest/googletest/include') {
+    return '<(root_relative_to_gypfile)/../gtest/include';
+  }
   return include.slice('../'.length);
 }
 
