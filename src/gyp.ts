@@ -606,10 +606,13 @@ class GypProjectBuilder {
     }
     const targetBuilder = new GypTargetBuilder();
     // TODO(kjin): Right now we filter non-mac_debug builds.
-    gnTargetBuildConfigs
+    const configs = gnTargetBuildConfigs
         .filter(
-            gnTargetBuildConfig => gnTargetBuildConfig.build === 'mac_debug')
-        .forEach(gnTargetBuildConfig => {
+            gnTargetBuildConfig => gnTargetBuildConfig.build === 'mac_debug');
+    if (configs.length === 0) {
+      return [];
+    }
+    configs.forEach(gnTargetBuildConfig => {
           const gnTarget =
               this.gnProject.getBuild(gnTargetBuildConfig.build)
                   .getTarget(
